@@ -139,9 +139,13 @@ export function buildLevel(level: number): LevelData {
   }
 
   const rows: WorkerPiece[][] = [[], [], [], [], []];
-  bag.forEach((color, i) => {
-    rows[i % 5].push(piece([color], rand));
-  });
+  for (const color of bag) {
+    let target = 0;
+    for (let i = 1; i < rows.length; i += 1) {
+      if (rows[i].length < rows[target].length) target = i;
+    }
+    rows[target].push(piece([color], rand));
+  }
 
   return { level, grid, rows };
 }
