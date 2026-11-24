@@ -98,3 +98,16 @@ Contributions welcome! Open issues for feature requests or bugs.
 
 ---
 Created as a starting foundation for the Pixelize game concept.
+
+
+## Playable web preview
+
+The phone game is also in [`web/`](web/). It is the same Pixelize loop: splash, yard menu, coins, progress, bonus tokens, and edge-only color peeling.
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+Then open http://127.0.0.1:8080. Art lives in `web/public/art`. Game rules are in `web/src/game`.
