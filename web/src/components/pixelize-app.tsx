@@ -1,10 +1,41 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { applyMusic, sfx, unlockAudio } from "@/game/audio";
-import { buildLevel, coinsFor, POINTS_PER_LEVEL, PROGRESS_MAX, type WorkerPiece } from "@/game/levels";
-import { cloneGrid, colorsOnBoard, hammer, remainingCount, type DotColor, type Grid } from "@/game/logic";
-import { grantProgress, loadSave, writeSave, type Save, type Settings, type TokenKind } from "@/game/store";
+import {
+  approaches,
+  bottomNode,
+  dotSize,
+  loadSize,
+  findPath,
+  gateNode,
+  gatePose,
+  legsAlong,
+  nodePose,
+  nudgePose,
+  rigSize,
+  type Board,
+  type CellNode,
+  type Face,
+  type Leg,
+} from "@/game/drive";
+import { buildLevel, buildPicture, coinsFor, POINTS_PER_LEVEL, PROGRESS_MAX, type WorkerPiece } from "@/game/levels";
+import { cloneGrid, colorRemains, colorsOnBoard, hammer, remainingCount, type DotColor, type Grid } from "@/game/logic";
+import { PICTURES } from "@/game/pictures";
+import { grantClear, loadSave, writeSave, type Save, type Settings, type TokenKind } from "@/game/store";
 
-const WORKER_SRC: Record<DotColor, string> = {
+const SWATCH: Record<string, string> = {
+  red: "#ff4b4b",
+  blue: "#3aa0ff",
+  yellow: "#ffd23a",
+  green: "#3dce73",
+  purple: "#b06bff",
+  orange: "#ff8a2a",
+};
+
+function swatch(color: string) {
+  return SWATCH[color] ?? color;
+}
+
+const WORKER_SRC: Record<string, string> = {
   red: "/art/worker-red.png",
   blue: "/art/worker-blue.png",
   yellow: "/art/worker-yellow.png",
@@ -17,31 +48,23 @@ const TOKEN_META: Record<TokenKind, { src: string; name: string; blurb: string }
   dual: {
     src: "/art/token-dual.png",
     name: "Two-tone worker",
-    blurb: "Drops a worker who hammers two random colors at once.",
+    blurb: "Two colors at once.",
   },
   box: {
     src: "/art/token-box.png",
     name: "Extra bay",
-    blurb: "Opens a sixth forklift bay for this picture.",
+    blurb: "One more forklift.",
   },
   wipe: {
     src: "/art/token-wipe.png",
     name: "Color wipe",
-    blurb: "You pick a color. Every dot of that color falls off, edges or not.",
+    blurb: "Clears one color.",
   },
 };
 
-type Phase =
-  | "walk"
-  | "drive"
-  | "wait"
-  | "enter"
-  | "to-gate"
-  | "unload"
-  | "from-gate"
-  | "exit"
-  | "down"
-  | "leave";
+type Phase = "walk" | "drive" | "wait" | "roll" | "load" | "drop" | "leave";
+type Job = "pick" | "haul" | "home" | "hold";
+type Spot = { row: number; col: number; color: DotColor };
 
 type Actor = {
   id: string;
@@ -50,7 +73,18 @@ type Actor = {
   phase: Phase;
   phaseStartedAt: number;
   skipWalk: boolean;
-  haulMs: number;
+  spots: Spot[] | null;
+  tx: number;
+  ty: number;
+  face: Face;
+  legs: Leg[];
+  legMs: number;
+  job: Job;
+  node: CellNode | null;
+  goal: CellNode | null;
+  target: Spot | null;
+  armed: boolean;
+  cargo: DotColor | null;
 };
 
 type PendingDot = {
@@ -70,6 +104,7 @@ type Flight = {
   dx: number;
   dy: number;
   born: number;
+  ms: number;
 };
 
 type Run = {
@@ -84,26 +119,16 @@ type Run = {
   bumped: number[];
   note: string;
   won: boolean;
+  lost: boolean;
+  picture: string | null;
+  pictureId: string | null;
   token: TokenKind | null;
   coinsGain: number;
 };
 
-const TICK = {
-  walk: 640,
-  drive: 700,
-  enter: 280,
-  unload: 200,
-  fromGate: 720,
-  exit: 280,
-  down: 660,
-  leave: 420,
-  flight: 560,
-};
-
-const ON_ROAD = new Set<Phase>(["enter", "to-gate", "unload", "from-gate", "exit"]);
-
+const TICK = { walk: 620, drive: 560, load: 240, drop: 240, leave: 400 };
+const ON_ROAD = new Set<Phase>(["roll", "load", "drop"]);
 const claimedWins = new Set<string>();
-
 type Screen = "splash" | "menu" | "game";
 
 function startRun(level: number): Run {
@@ -120,6 +145,32 @@ function startRun(level: number): Run {
     bumped: [0, 0, 0, 0, 0],
     note: "",
     won: false,
+    lost: false,
+    picture: null,
+    pictureId: null,
+    token: null,
+    coinsGain: 0,
+  };
+}
+
+function startPicture(id: string): Run {
+  const picture = PICTURES.find((entry) => entry.id === id) ?? PICTURES[0];
+  const built = buildPicture(picture);
+  return {
+    id: `pic-${picture.id}-${Date.now()}`,
+    level: 0,
+    grid: built.grid,
+    rows: built.rows,
+    forks: 5,
+    actors: [],
+    pending: [],
+    flights: [],
+    bumped: [0, 0, 0, 0, 0],
+    note: "",
+    won: false,
+    lost: false,
+    picture: picture.title,
+    pictureId: picture.id,
     token: null,
     coinsGain: 0,
   };
@@ -130,21 +181,15 @@ function phaseLimit(actor: Actor): number {
     case "walk":
       return actor.skipWalk ? 0 : TICK.walk;
     case "drive":
-      return TICK.drive;
+      return actor.armed ? actor.legMs : 0;
     case "wait":
       return Number.POSITIVE_INFINITY;
-    case "enter":
-      return TICK.enter;
-    case "to-gate":
-      return actor.haulMs;
-    case "unload":
-      return TICK.unload;
-    case "from-gate":
-      return TICK.fromGate;
-    case "exit":
-      return TICK.exit;
-    case "down":
-      return TICK.down;
+    case "roll":
+      return actor.legMs;
+    case "load":
+      return TICK.load;
+    case "drop":
+      return TICK.drop;
     case "leave":
       return TICK.leave;
     default:
@@ -152,24 +197,175 @@ function phaseLimit(actor: Actor): number {
   }
 }
 
-type Measure = (dot: PendingDot) => Flight | null;
+type WorldView = {
+  board: (lane: number, cols: number, rows: number) => Board | null;
+  waitPose: (lane: number, cols: number, rows: number) => { tx: number; ty: number };
+  toGate: (dot: PendingDot) => Flight | null;
+  toFork: (dot: Spot, lane: number, face: Face, tx: number, ty: number, cols: number, rows: number) => Flight | null;
+};
 
-function stepWorld(prev: Run, now: number, measure: Measure, onSound: (kind: "hammer" | "miss") => void): Run {
+function freshActor(piece: WorkerPiece, lane: number, phase: Phase): Actor {
+  return {
+    id: piece.id,
+    piece,
+    lane,
+    phase,
+    phaseStartedAt: performance.now(),
+    skipWalk: phase !== "walk",
+    spots: null,
+    tx: 0,
+    ty: 0,
+    face: "right",
+    legs: [],
+    legMs: 0,
+    job: "pick",
+    node: null,
+    goal: null,
+    target: null,
+    armed: false,
+    cargo: null,
+  };
+}
+
+function withLeg(actor: Actor, legs: Leg[], job: Job, goal: CellNode | null, now: number): Actor {
+  const [first, ...rest] = legs;
+  if (!first) {
+    const phase: Phase = job === "pick" ? "load" : job === "haul" ? "drop" : job === "hold" ? "wait" : "leave";
+    return { ...actor, phase, job, goal, node: goal, legs: [], legMs: 0, phaseStartedAt: now };
+  }
+  return {
+    ...actor,
+    phase: "roll",
+    job,
+    goal,
+    legs: rest,
+    tx: first.tx,
+    ty: first.ty,
+    face: first.face,
+    legMs: first.ms,
+    phaseStartedAt: now,
+    armed: true,
+  };
+}
+
+function reachableSpots(grid: Grid, board: Board, colors: DotColor[], from: CellNode) {
+  return hammer(grid, colors).removed.filter((dot) =>
+    approaches(grid, board, dot).some((side) => findPath(grid, board, from, side.node)),
+  );
+}
+
+function nearestSpot(grid: Grid, board: Board, spots: Spot[], from: CellNode) {
+  let best: { spot: Spot; node: CellNode; face: Face; path: CellNode[] } | null = null;
+  const rank = (face: Face) => (face === "left" ? 3 : face === "down" ? 2 : face === "up" ? 1 : 0);
+  for (const spot of spots) {
+    if (grid[spot.row]?.[spot.col] !== spot.color) continue;
+    for (const side of approaches(grid, board, spot)) {
+      const path = findPath(grid, board, from, side.node);
+      if (!path) continue;
+      if (!best || path.length < best.path.length || (path.length === best.path.length && rank(side.face) < rank(best.face))) {
+        best = { spot, node: side.node, face: side.face, path };
+      }
+    }
+  }
+  return best;
+}
+
+function posePoints(board: Board, path: CellNode[]) {
+  return path.map((node) => nodePose(board, node));
+}
+
+function pickupLegs(board: Board, grid: Grid, actor: Actor, choice: NonNullable<ReturnType<typeof nearestSpot>>) {
+  const points = [{ tx: actor.tx, ty: actor.ty }];
+  if (!actor.node) {
+    const start = bottomNode(board, board.originX + board.rigW / 2);
+    points.push(nodePose(board, start));
+    const path = findPath(grid, board, start, choice.node) ?? [start, choice.node];
+    points.push(...posePoints(board, path.slice(1)));
+  } else {
+    points.push(nodePose(board, actor.node));
+    points.push(...posePoints(board, choice.path.slice(1)));
+  }
+  points.push(nudgePose(board, choice.node, choice.face));
+  const legs = legsAlong(points, actor.face);
+  if (legs.length) legs[legs.length - 1] = { ...legs[legs.length - 1], face: choice.face };
+  return legs;
+}
+
+function haulLegs(board: Board, grid: Grid, actor: Actor) {
+  const dock = gateNode(board);
+  const parked = gatePose(board);
+  const points = [{ tx: actor.tx, ty: actor.ty }];
+  if (actor.node) {
+    points.push(nodePose(board, actor.node));
+    const path = findPath(grid, board, actor.node, dock) ?? [actor.node, dock];
+    points.push(...posePoints(board, path.slice(1)));
+  }
+  const dockPose = nodePose(board, dock);
+  points.push({ tx: dockPose.tx, ty: parked.ty });
+  points.push(parked);
+  return legsAlong(points, "right");
+}
+
+function homeLegs(board: Board, grid: Grid, actor: Actor) {
+  const laneNode = bottomNode(board, board.originX + board.rigW / 2);
+  const points = [{ tx: actor.tx, ty: actor.ty }];
+  if (actor.node) {
+    points.push(nodePose(board, actor.node));
+    const path = findPath(grid, board, actor.node, laneNode) ?? [actor.node, laneNode];
+    points.push(...posePoints(board, path.slice(1)));
+  } else {
+    points.push(nodePose(board, laneNode));
+  }
+  const lanePose = nodePose(board, laneNode);
+  points.push({ tx: 0, ty: lanePose.ty });
+  points.push({ tx: 0, ty: 0 });
+  return legsAlong(points, actor.face);
+}
+
+function missHome(actor: Actor, now: number): Actor {
+  return withLeg(actor, legsAlong([{ tx: actor.tx, ty: actor.ty }, { tx: 0, ty: 0 }], "down"), "home", null, now);
+}
+
+function parkHold(actor: Actor, board: Board, grid: Grid, now: number): Actor {
+  if (!colorRemains(grid, actor.piece.colors)) {
+    return withLeg({ ...actor, spots: null, target: null, cargo: null }, homeLegs(board, grid, actor), "home", null, now);
+  }
+  if (actor.phase === "wait" && actor.tx === 0 && actor.ty === 0) return actor;
+  return withLeg({ ...actor, spots: null, target: null, cargo: null }, homeLegs(board, grid, actor), "hold", null, now);
+}
+
+function startPick(actor: Actor, grid: Grid, view: WorldView, cols: number, rows: number, now: number, _onSound: (kind: "hammer" | "miss") => void) {
+  const board = view.board(actor.lane, cols, rows);
+  if (!board) {
+    if (actor.phase === "wait") return { actor, note: "" };
+    return { actor: { ...actor, phase: "wait" as const, phaseStartedAt: now, armed: true }, note: "" };
+  }
+  const from = actor.node ?? bottomNode(board, board.originX + board.rigW / 2);
+  const spots = reachableSpots(grid, board, actor.piece.colors, from);
+  const choice = nearestSpot(grid, board, spots, from);
+  if (!choice) return { actor: parkHold(actor, board, grid, now), note: "" };
+  const next = { ...actor, spots, target: choice.spot };
+  return { actor: withLeg(next, pickupLegs(board, grid, next, choice), "pick", choice.node, now), note: "" };
+}
+
+function stepWorld(prev: Run, now: number, view: WorldView, onSound: (kind: "hammer" | "miss") => void): Run {
+  if (prev.lost) return prev;
   const due = prev.pending.filter((dot) => dot.at <= now);
   let pending = prev.pending.filter((dot) => dot.at > now);
-  const flights = prev.flights.filter((flight) => now - flight.born < TICK.flight);
+  const flights = prev.flights.filter((flight) => now - flight.born < flight.ms + 40);
   let grid = prev.grid;
   if (due.length) {
     grid = cloneGrid(prev.grid);
     for (const dot of due) {
       if (grid[dot.row]?.[dot.col] === dot.color) {
         grid[dot.row][dot.col] = null;
-        const flight = measure(dot);
+        const flight = view.toGate(dot);
         if (flight) flights.push(flight);
       }
     }
   }
-
+  const cols = grid[0]?.length ?? 1;
+  const rows = grid.length;
   const actors = prev.actors.map((actor) => ({ ...actor }));
   const gone = new Set<string>();
   let note = prev.note;
@@ -182,7 +378,6 @@ function stepWorld(prev: Run, now: number, measure: Measure, onSound: (kind: "ha
       const br = ON_ROAD.has(b.actor.phase) ? 0 : 1;
       return ar - br || a.actor.phaseStartedAt - b.actor.phaseStartedAt;
     });
-
   const replace = (index: number, next: Actor | null) => {
     moved = true;
     if (!next) gone.add(actors[index].id);
@@ -196,51 +391,115 @@ function stepWorld(prev: Run, now: number, measure: Measure, onSound: (kind: "ha
       replace(index, null);
       continue;
     }
-    if (actor.phase === "drive") {
-      replace(index, { ...actor, phase: roadBusy() ? "wait" : "enter", phaseStartedAt: now });
+    if (actor.phase === "walk") {
+      replace(index, { ...actor, phase: "drive", phaseStartedAt: now, armed: false });
       continue;
     }
-    if (actor.phase === "enter") {
-      const removed = [...hammer(grid, actor.piece.colors).removed].sort((a, b) => b.col - a.col || a.row - b.row);
-      if (!removed.length) {
-        onSound("miss");
-        note = "Nothing on the edge matches that worker.";
-        replace(index, { ...actor, phase: "exit", phaseStartedAt: now, haulMs: 0 });
+    if (actor.phase === "drive" && !actor.armed) {
+      replace(index, {
+        ...actor,
+        ...view.waitPose(actor.lane, cols, rows),
+        face: "up",
+        legMs: TICK.drive,
+        armed: true,
+        phaseStartedAt: now,
+      });
+      continue;
+    }
+    if (actor.phase === "drive") {
+      if (roadBusy()) replace(index, { ...actor, phase: "wait", phaseStartedAt: now, armed: true });
+      else {
+        const started = startPick(actor, grid, view, cols, rows, now, onSound);
+        if (started.note) note = started.note;
+        if (started.actor !== actor) replace(index, started.actor);
+      }
+      continue;
+    }
+    if (actor.phase === "roll") {
+      if (actor.legs.length) {
+        const [first, ...rest] = actor.legs;
+        replace(index, { ...actor, legs: rest, tx: first.tx, ty: first.ty, face: first.face, legMs: first.ms, phaseStartedAt: now });
         continue;
       }
-      const haulMs = Math.min(2200, Math.max(720, removed.length * 150));
-      const spacing = haulMs / removed.length;
-      pending = pending.concat(
-        removed.map((dot, i) => ({
-          id: `${actor.id}-${dot.row}-${dot.col}`,
-          row: dot.row,
-          col: dot.col,
-          color: dot.color,
-          at: now + Math.max(24, i * spacing),
-        })),
-      );
-      onSound("hammer");
-      replace(index, { ...actor, phase: "to-gate", phaseStartedAt: now, haulMs });
+      const arrived = { ...actor, node: actor.goal, legs: [] };
+      if (actor.job === "pick") {
+        const board = view.board(actor.lane, cols, rows);
+        const spot = actor.target;
+        if (!board || !spot || grid[spot.row]?.[spot.col] !== spot.color) {
+          const from = arrived.node ?? (board ? bottomNode(board, board.originX + board.rigW / 2) : null);
+          const choice = board && from ? nearestSpot(grid, board, actor.spots ?? [], from) : null;
+          if (choice && board) {
+            replace(index, withLeg({ ...arrived, target: choice.spot }, pickupLegs(board, grid, arrived, choice), "pick", choice.node, now));
+          } else if (board) {
+            const held = parkHold(arrived, board, grid, now);
+            if (held !== arrived) replace(index, held);
+          }
+          continue;
+        }
+        if (grid === prev.grid) grid = cloneGrid(grid);
+        grid[spot.row][spot.col] = null;
+        const flight = view.toFork(spot, actor.lane, actor.face, actor.tx, actor.ty, cols, rows);
+        if (flight) flights.push(flight);
+        onSound("hammer");
+        const remaining = (actor.spots ?? []).filter((item) => item.row !== spot.row || item.col !== spot.col);
+        replace(index, { ...arrived, phase: "load", spots: remaining, target: spot, cargo: null, phaseStartedAt: now });
+        continue;
+      }
+      if (actor.job === "haul") {
+        replace(index, { ...arrived, phase: "drop", phaseStartedAt: now });
+        continue;
+      }
+      if (actor.job === "hold") {
+        replace(index, {
+          ...arrived,
+          phase: "wait",
+          node: null,
+          goal: null,
+          cargo: null,
+          spots: null,
+          target: null,
+          tx: 0,
+          ty: 0,
+        });
+        continue;
+      }
+      replace(index, { ...arrived, phase: "leave", phaseStartedAt: now, tx: 0, ty: 0, cargo: null });
       continue;
     }
-    const follow: Partial<Record<Phase, Phase>> = {
-      walk: "drive",
-      "to-gate": "unload",
-      unload: "from-gate",
-      "from-gate": "exit",
-      exit: "down",
-      down: "leave",
-    };
-    const nextPhase = follow[actor.phase];
-    if (nextPhase) replace(index, { ...actor, phase: nextPhase, phaseStartedAt: now });
+    if (actor.phase === "load") {
+      const board = view.board(actor.lane, cols, rows);
+      const loaded = { ...actor, cargo: actor.target?.color ?? null, target: null };
+      replace(index, board ? withLeg(loaded, haulLegs(board, grid, loaded), "haul", gateNode(board), now) : missHome(loaded, now));
+      continue;
+    }
+    if (actor.phase === "drop") {
+      const board = view.board(actor.lane, cols, rows);
+      const from = actor.node ?? (board ? gateNode(board) : null);
+      const pendingSpots = (actor.spots ?? []).filter((spot) => grid[spot.row]?.[spot.col] === spot.color);
+      const choice = board && from ? nearestSpot(grid, board, pendingSpots, from) : null;
+      if (board && choice && from) {
+        const nextActor = { ...actor, spots: pendingSpots, cargo: null, node: from, target: choice.spot };
+        replace(index, withLeg(nextActor, pickupLegs(board, grid, nextActor, choice), "pick", choice.node, now));
+      } else if (board) {
+        replace(index, parkHold({ ...actor, cargo: null, spots: null, node: from ?? actor.node }, board, grid, now));
+      } else {
+        replace(index, missHome({ ...actor, cargo: null }, now));
+      }
+    }
   }
 
   if (!roadBusy()) {
-    const waiter = actors
+    const waiters = actors
       .map((actor, index) => ({ actor, index }))
       .filter(({ actor }) => !gone.has(actor.id) && actor.phase === "wait")
-      .sort((a, b) => a.actor.phaseStartedAt - b.actor.phaseStartedAt)[0];
-    if (waiter) replace(waiter.index, { ...waiter.actor, phase: "enter", phaseStartedAt: now });
+      .sort((a, b) => a.actor.phaseStartedAt - b.actor.phaseStartedAt);
+    for (const waiter of waiters) {
+      const started = startPick(waiter.actor, grid, view, cols, rows, now, onSound);
+      if (started.actor === waiter.actor) continue;
+      if (started.note) note = started.note;
+      replace(waiter.index, started.actor);
+      break;
+    }
   }
 
   const nextActors = actors.filter((actor) => !gone.has(actor.id));
@@ -260,8 +519,15 @@ function openFork(run: Run): number {
   return -1;
 }
 
+function cellBox(gridEl: HTMLElement, cols: number, rows: number, dot: { row: number; col: number }) {
+  const gridBox = gridEl.getBoundingClientRect();
+  const cellW = gridBox.width / cols;
+  const cellH = gridBox.height / rows;
+  return { x: gridBox.left + dot.col * cellW, y: gridBox.top + dot.row * cellH, w: cellW, h: cellH };
+}
+
 function measureFlight(
-  frame: HTMLElement | null,
+  shell: HTMLElement | null,
   gridEl: HTMLElement | null,
   gate: HTMLElement | null,
   cols: number,
@@ -269,21 +535,16 @@ function measureFlight(
   dot: PendingDot,
   born: number,
 ): Flight | null {
-  if (!frame || !gridEl || !gate || cols < 1 || rows < 1) return null;
-  const frameBox = frame.getBoundingClientRect();
-  const gridBox = gridEl.getBoundingClientRect();
+  if (!shell || !gridEl || !gate || cols < 1 || rows < 1) return null;
+  const shellBox = shell.getBoundingClientRect();
   const gateBox = gate.getBoundingClientRect();
-  const frameStyle = getComputedStyle(frame);
-  const borderLeft = Number.parseFloat(frameStyle.borderLeftWidth) || 0;
-  const borderTop = Number.parseFloat(frameStyle.borderTopWidth) || 0;
-  const cellW = gridBox.width / cols;
-  const cellH = gridBox.height / rows;
-  const x = gridBox.left - frameBox.left - borderLeft + dot.col * cellW;
-  const y = gridBox.top - frameBox.top - borderTop + dot.row * cellH;
-  const size = Math.max(6, Math.min(cellW, cellH) - 2);
-  const gx = gateBox.left - frameBox.left - borderLeft + gateBox.width * 0.28;
-  const gy = gateBox.top - frameBox.top - borderTop + gateBox.height * 0.42;
-  return { id: dot.id, color: dot.color, x, y, size, dx: gx - x, dy: gy - y, born };
+  const cell = cellBox(gridEl, cols, rows, dot);
+  const size = Number.parseFloat(getComputedStyle(shell).getPropertyValue("--dot")) || Math.max(8, Math.min(cell.w, cell.h) * 0.72);
+  const x = cell.x + (cell.w - size) / 2 - shellBox.left;
+  const y = cell.y + (cell.h - size) / 2 - shellBox.top;
+  const gx = gateBox.left - shellBox.left + gateBox.width * 0.55;
+  const gy = gateBox.top - shellBox.top + gateBox.height * 0.55;
+  return { id: dot.id, color: dot.color, x, y, size, dx: gx - x, dy: gy - y, born, ms: 420 };
 }
 
 export function PixelizeApp() {
@@ -334,6 +595,21 @@ export function PixelizeApp() {
     commit({ ...save, settings: { ...save.settings, ...partial } });
   };
 
+  const openPicture = (id: string) => {
+    if (!save) return;
+    const picture = PICTURES.find((entry) => entry.id === id);
+    if (!picture) return;
+    unlockAudio();
+    sfx.tap(save.settings);
+    setPanel(null);
+    setSplashText(picture.title);
+    setScreen("splash");
+    window.setTimeout(() => {
+      commitRun(() => startPicture(id));
+      setScreen("game");
+    }, 1500);
+  };
+
   const openLevel = () => {
     if (!save) return;
     unlockAudio();
@@ -351,7 +627,7 @@ export function PixelizeApp() {
   const awarded = useRef(false);
 
   useEffect(() => {
-    if (!run || run.won || run.actors.length > 0 || run.pending.length > 0 || remainingCount(run.grid) !== 0) {
+    if (!run || run.won || run.actors.length > 0 || run.pending.length > 0 || run.flights.length > 0 || remainingCount(run.grid) !== 0) {
       if (run && remainingCount(run.grid) !== 0) awarded.current = false;
       return;
     }
@@ -360,38 +636,31 @@ export function PixelizeApp() {
     claimedWins.add(run.id);
     const current = saveRef.current;
     if (!current) return;
-    const { save: next, token } = grantProgress(current, run.level);
+    const coins = run.pictureId ? coinsFor(Math.max(1, current.level)) : coinsFor(run.level);
+    const { save: next, token } = grantClear(current, coins, run.pictureId ? null : run.level + 1);
     commit(next);
     sfx.win(next.settings);
     if (token) sfx.token(next.settings);
     commitRun((prev) => {
       if (!prev || prev.won) return prev;
-      return { ...prev, won: true, token, coinsGain: coinsFor(prev.level) };
+      return { ...prev, won: true, token, coinsGain: prev.pictureId ? coinsFor(Math.max(1, current.level)) : coinsFor(prev.level) };
     });
   }, [run, commit, commitRun]);
 
   const sendWorker = (lane: number) => {
     const current = runRef.current;
     const settings = saveRef.current?.settings;
-    if (!current || !settings || current.won) return;
+    if (!current || !settings || current.won || current.lost) return;
     unlockAudio();
+    const piece = current.rows[lane]?.[0];
+    if (!piece) return;
     if (current.actors.some((actor) => actor.lane === lane)) {
       setShake(true);
       window.setTimeout(() => setShake(false), 280);
       commitRun((prev) => (prev ? { ...prev, note: "That forklift is still out." } : prev));
       return;
     }
-    const row = current.rows[lane];
-    if (!row?.length) return;
-    if (!hammer(current.grid, row[0].colors).removed.length) {
-      sfx.miss(settings);
-      setShake(true);
-      window.setTimeout(() => setShake(false), 280);
-      commitRun((prev) => (prev ? { ...prev, note: "Nothing on the edge matches that worker." } : prev));
-      return;
-    }
     sfx.load(settings);
-    const piece = row[0];
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     commitRun((prev) => {
       if (!prev || prev.won) return prev;
@@ -400,25 +669,19 @@ export function PixelizeApp() {
       if (!line?.length || line[0]?.id !== piece.id) return prev;
       const rows = prev.rows.map((entry) => entry.slice());
       rows[lane].shift();
-      if (reduce) return { ...prev, grid: hammer(prev.grid, piece.colors).grid, rows, note: "" };
+      if (reduce && hammer(prev.grid, piece.colors).removed.length) {
+        return { ...prev, grid: hammer(prev.grid, piece.colors).grid, rows, note: "" };
+      }
       const bumped = prev.bumped.slice();
       bumped[lane] = (bumped[lane] ?? 0) + 1;
-      const actor: Actor = {
-        id: piece.id,
-        piece,
-        lane,
-        phase: "walk",
-        phaseStartedAt: performance.now(),
-        skipWalk: false,
-        haulMs: 720,
-      };
+      const actor = freshActor(piece, lane, "walk");
       return { ...prev, rows, bumped, actors: [...prev.actors, actor], note: "" };
     });
   };
 
   const useToken = (kind: TokenKind) => {
     const current = runRef.current;
-    if (!save || !current || current.won) return;
+    if (!save || !current || current.won || current.lost) return;
     if (save.tokens[kind] <= 0) return;
     unlockAudio();
     if (kind === "box") {
@@ -447,15 +710,7 @@ export function PixelizeApp() {
       const id = `dual-${Date.now()}`;
       commit({ ...save, tokens: { ...save.tokens, dual: save.tokens.dual - 1 } });
       sfx.token(save.settings);
-      const actor: Actor = {
-        id,
-        piece: { id, colors: [first, second] },
-        lane,
-        phase: "drive",
-        phaseStartedAt: performance.now(),
-        skipWalk: true,
-        haulMs: 720,
-      };
+      const actor = freshActor({ id, colors: [first, second] }, lane, "drive");
       commitRun((prev) => {
         if (!prev || prev.actors.some((entry) => entry.lane === lane)) return prev;
         return { ...prev, actors: [...prev.actors, actor], note: "Two-tone worker takes a forklift." };
@@ -467,7 +722,7 @@ export function PixelizeApp() {
 
   const confirmWipe = (color: DotColor) => {
     const current = runRef.current;
-    if (!save || !current || save.tokens.wipe <= 0) return;
+    if (!save || !current || current.lost || save.tokens.wipe <= 0) return;
     const dots: PendingDot[] = [];
     const started = performance.now();
     for (let row = 0; row < current.grid.length; row += 1) {
@@ -525,6 +780,7 @@ export function PixelizeApp() {
         <Menu
           save={save}
           onLevel={openLevel}
+          onPicture={openPicture}
           onSettings={() => setPanel("settings")}
           onShop={() => setPanel("shop")}
           onPouch={() => setPanel("pouch")}
@@ -532,6 +788,7 @@ export function PixelizeApp() {
       ) : null}
       {screen === "game" && run ? (
         <GameView
+          key={run.id}
           run={run}
           save={save}
           shake={shake}
@@ -542,7 +799,7 @@ export function PixelizeApp() {
             setScreen("menu");
             setPanel(null);
           }}
-          onRestart={() => commitRun(() => startRun(run.level))}
+          onRestart={() => commitRun(() => (run.pictureId ? startPicture(run.pictureId) : startRun(run.level)))}
           onNext={() => {
             commitRun(() => null);
             setScreen("menu");
@@ -598,14 +855,14 @@ export function PixelizeApp() {
 
       {panel === "wipe" && run ? (
         <Sheet title="Pick a color" onClose={() => setPanel(null)}>
-          <p className="text-sm font-extrabold text-ink-soft">Every dot of this color comes off.</p>
           <div className="flex flex-wrap gap-3">
             {colorsOnBoard(run.grid).map((color) => (
               <button
                 key={color}
                 type="button"
                 onClick={() => confirmWipe(color)}
-                className={`dot size-12 ${dotClass(color)}`}
+                className="dot size-12"
+                style={{ background: swatch(color) }}
                 aria-label={color}
               />
             ))}
@@ -631,12 +888,14 @@ function Splash({ text }: { text: string }) {
 function Menu({
   save,
   onLevel,
+  onPicture,
   onSettings,
   onShop,
   onPouch,
 }: {
   save: Save;
   onLevel: () => void;
+  onPicture: (id: string) => void;
   onSettings: () => void;
   onShop: () => void;
   onPouch: () => void;
@@ -665,7 +924,7 @@ function Menu({
           </button>
         </div>
 
-        <div className="flex flex-1 flex-col items-center justify-center gap-4">
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 overflow-y-auto py-4">
           <h1 className="title-stroke text-6xl">Pixelize</h1>
           <button
             type="button"
@@ -674,9 +933,17 @@ function Menu({
           >
             Level {save.level}
           </button>
-          <p className="max-w-[16rem] text-center text-sm font-extrabold text-cream drop-shadow">
-            Send workers one at a time. They only knock off dots that match them, and only dots on the edge.
-          </p>
+          {PICTURES.map((picture) => (
+            <button
+              key={picture.id}
+              type="button"
+              onClick={() => onPicture(picture.id)}
+              className="rounded-full bg-cream px-6 py-2 text-center shadow-lg"
+            >
+              <span className="block font-display text-2xl text-ink">Masterpiece</span>
+              <span className="block text-sm font-extrabold text-ink-soft">{picture.title}</span>
+            </button>
+          ))}
           <button
             type="button"
             onClick={onPouch}
@@ -735,6 +1002,7 @@ function GameView({
   onRestart: () => void;
   onNext: () => void;
 }) {
+  const shellRef = useRef<HTMLDivElement>(null);
   const frameRef = useRef<HTMLElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
   const gateRef = useRef<HTMLDivElement>(null);
@@ -745,32 +1013,90 @@ function GameView({
   const height = run.grid.length;
   const width = run.grid[0]?.length ?? 1;
   const left = remainingCount(run.grid);
-  const busy = run.actors.length > 0 || run.pending.length > 0;
-  const useful = crewCanWork(run);
-  const stuck = !run.won && !busy && left > 0 && !useful;
+
+  const readBoard = (lane: number, cols: number, rows: number): Board | null => {
+    const frame = frameRef.current;
+    const gridEl = gridRef.current;
+    const gate = gateRef.current;
+    const laneEl = laneRefs.current[lane];
+    if (!frame || !gridEl || !gate || !laneEl || cols < 1 || rows < 1) return null;
+    const gridBox = gridEl.getBoundingClientRect();
+    const frameBox = frame.getBoundingClientRect();
+    const gateBox = gate.getBoundingClientRect();
+    const laneBox = laneEl.getBoundingClientRect();
+    const frameStyle = getComputedStyle(frame);
+    const borderLeft = Number.parseFloat(frameStyle.borderLeftWidth) || 0;
+    const borderRight = Number.parseFloat(frameStyle.borderRightWidth) || 0;
+    const borderTop = Number.parseFloat(frameStyle.borderTopWidth) || 0;
+    const borderBottom = Number.parseFloat(frameStyle.borderBottomWidth) || 0;
+    const cellW = gridBox.width / cols;
+    const cellH = gridBox.height / rows;
+    const road = Math.min(
+      gridBox.left - (frameBox.left + borderLeft),
+      frameBox.right - borderRight - gridBox.right,
+      gridBox.top - (frameBox.top + borderTop),
+      frameBox.bottom - borderBottom - gridBox.bottom,
+    );
+    const sized = rigSize(cellW, cellH, Math.max(10, road));
+    return {
+      cols,
+      rows,
+      gridLeft: gridBox.left,
+      gridTop: gridBox.top,
+      cellW,
+      cellH,
+      frameLeft: frameBox.left + borderLeft,
+      frameTop: frameBox.top + borderTop,
+      frameRight: frameBox.right - borderRight,
+      frameBottom: frameBox.bottom - borderBottom,
+      originX: laneBox.left + laneBox.width / 2 - sized.rigW / 2,
+      originY: laneBox.top + 4,
+      rigW: sized.rigW,
+      rigH: sized.rigH,
+      gateLeft: gateBox.left,
+      gateTop: gateBox.top,
+      gateW: gateBox.width,
+      gateH: gateBox.height,
+    };
+  };
+
+  const jammed = forkliftsJammed(run, readBoard);
+
+  useEffect(() => {
+    if (!jammed) return;
+    commitRun((prev) => (prev && !prev.lost && !prev.won ? { ...prev, lost: true, note: "" } : prev));
+  }, [jammed, commitRun]);
 
   const measureLanes = () => {
+    const gridEl = gridRef.current;
     const frame = frameRef.current;
-    if (!frame) return;
-    const frameBox = frame.getBoundingClientRect();
     const dock = footerRef.current?.getBoundingClientRect().height ?? 92;
-    const gate = gateRef.current?.getBoundingClientRect();
-    for (let lane = 0; lane < laneRefs.current.length; lane += 1) {
-      const laneEl = laneRefs.current[lane];
+    if (gridEl && frame && shellRef.current) {
+      const box = gridEl.getBoundingClientRect();
+      const frameBox = frame.getBoundingClientRect();
+      const frameStyle = getComputedStyle(frame);
+      const borderLeft = Number.parseFloat(frameStyle.borderLeftWidth) || 0;
+      const borderRight = Number.parseFloat(frameStyle.borderRightWidth) || 0;
+      const borderTop = Number.parseFloat(frameStyle.borderTopWidth) || 0;
+      const borderBottom = Number.parseFloat(frameStyle.borderBottomWidth) || 0;
+      const cellW = box.width / Math.max(1, width);
+      const cellH = box.height / Math.max(1, height);
+      const road = Math.min(
+        box.left - (frameBox.left + borderLeft),
+        frameBox.right - borderRight - box.right,
+        box.top - (frameBox.top + borderTop),
+        frameBox.bottom - borderBottom - box.bottom,
+      );
+      const sized = rigSize(cellW, cellH, Math.max(10, road));
+      shellRef.current.style.setProperty("--rig-w", `${sized.rigW}px`);
+      shellRef.current.style.setProperty("--rig-h", `${sized.rigH}px`);
+      shellRef.current.style.setProperty("--dot", `${loadSize(sized.rigW, cellW, cellH)}px`);
+    }
+    for (const laneEl of laneRefs.current) {
       if (!laneEl) continue;
       const laneBox = laneEl.getBoundingClientRect();
-      const forkTop = laneBox.top + 4;
-      const forkHeight = 40;
-      const lift = Math.max(48, forkTop - (frameBox.bottom - forkHeight - 8));
-      const waitLift = Math.max(24, lift - forkHeight - 12);
-      const forkCenter = laneBox.left + laneBox.width / 2;
-      const haulX = gate ? gate.left + gate.width * 0.35 - forkCenter : 80;
-      const slotTop = laneBox.bottom - dock - 56;
-      const walk = Math.max(16, slotTop - (forkTop + forkHeight) - 2);
-      laneEl.style.setProperty("--lift", `${lift}px`);
-      laneEl.style.setProperty("--wait-lift", `${waitLift}px`);
-      laneEl.style.setProperty("--haul-x", `${haulX}px`);
-      laneEl.style.setProperty("--walk", `${walk}px`);
+      const workerTop = laneBox.bottom - dock - 3 * 44 - 18;
+      laneEl.style.setProperty("--walk", `${Math.max(8, workerTop - (laneBox.top + 28))}px`);
       laneEl.style.setProperty("--dock", `${dock}px`);
     }
   };
@@ -780,7 +1106,7 @@ function GameView({
     const observer = new ResizeObserver(() => measureLanes());
     if (frameRef.current) observer.observe(frameRef.current);
     return () => observer.disconnect();
-  }, [run.forks, run.note]);
+  }, [run.forks, run.level, width, height]);
 
   useEffect(() => {
     let frame = 0;
@@ -791,16 +1117,44 @@ function GameView({
         if (!prev) return prev;
         if (!prev.actors.length && !prev.pending.length && !prev.flights.length) return prev;
         const cols = prev.grid[0]?.length ?? 1;
-        return stepWorld(
-          prev,
-          now,
-          (dot) => measureFlight(frameRef.current, gridRef.current, gateRef.current, cols, prev.grid.length, dot, now),
-          (kind) => {
-            const settings = saveLive.current.settings;
-            if (kind === "hammer") sfx.hammer(settings);
-            else sfx.miss(settings);
+        const rows = prev.grid.length;
+        const view: WorldView = {
+          board: readBoard,
+          waitPose: (lane, laneCols, laneRows) => {
+            const board = readBoard(lane, laneCols, laneRows);
+            if (!board) return { tx: 0, ty: -36 };
+            return { tx: 0, ty: Math.min(-12, board.frameBottom + 6 - board.originY) };
           },
-        );
+          toGate: (dot) => measureFlight(shellRef.current, gridRef.current, gateRef.current, cols, rows, dot, now),
+          toFork: (dot, lane, face, tx, ty, laneCols, laneRows) => {
+            const board = readBoard(lane, laneCols, laneRows);
+            const shell = shellRef.current;
+            const gridEl = gridRef.current;
+            if (!board || !shell || !gridEl) return null;
+            const shellBox = shell.getBoundingClientRect();
+            const cell = cellBox(gridEl, laneCols, laneRows, dot);
+            const size = dotSize(board);
+            const x = cell.x + (cell.w - size) / 2 - shellBox.left;
+            const y = cell.y + (cell.h - size) / 2 - shellBox.top;
+            const tip = forkTip(board, face, tx, ty);
+            return {
+              id: `${dot.row}-${dot.col}-${lane}`,
+              color: dot.color,
+              x,
+              y,
+              size,
+              dx: tip.x - shellBox.left - x,
+              dy: tip.y - shellBox.top - y,
+              born: now,
+              ms: TICK.load,
+            };
+          },
+        };
+        return stepWorld(prev, now, view, (kind) => {
+          const settings = saveLive.current.settings;
+          if (kind === "hammer") sfx.hammer(settings);
+          else sfx.miss(settings);
+        });
       });
       frame = requestAnimationFrame(loop);
     };
@@ -812,24 +1166,27 @@ function GameView({
   }, [commitRun]);
 
   return (
-    <div className="relative mx-auto flex h-dvh max-w-[440px] flex-col overflow-hidden bg-ink text-cream [--dock:5.75rem]">
+    <div
+      ref={shellRef}
+      className="relative mx-auto flex h-dvh max-w-[440px] flex-col overflow-hidden bg-ink text-cream [--dock:5.75rem] [--dot:12px] [--peek:1.15rem] [--rig-h:26px] [--rig-w:36px] [--slot:2.75rem]"
+    >
       <header className="flex items-center justify-between px-3 py-2">
         <button type="button" onClick={onHome} className="rounded-full bg-ink-soft px-3 py-2 text-sm font-extrabold">
           Yard
         </button>
-        <p className="font-display text-xl">Level {run.level}</p>
+        <p className="max-w-[12rem] truncate text-center font-display text-xl">{run.picture ?? `Level ${run.level}`}</p>
         <p className="text-sm font-extrabold">{left} dots</p>
       </header>
       {run.note ? <p className="px-3 pb-1 text-center text-xs font-extrabold text-amber">{run.note}</p> : null}
 
-      <section
-        ref={frameRef}
-        className="relative mx-3 flex h-[40dvh] min-h-[190px] flex-col overflow-hidden rounded-[var(--radius-card)] border-4 border-cream bg-ink-soft"
-      >
-        <div className="flex min-h-0 flex-1 items-center justify-center px-2 pt-2 [container-type:size]">
+      <div className="mx-2 flex min-h-[190px] items-stretch gap-1">
+        <section
+          ref={frameRef}
+          className="relative flex h-[40dvh] min-h-[190px] min-w-0 flex-1 items-center justify-center overflow-hidden rounded-[var(--radius-card)] border-4 border-cream bg-ink-soft p-9 [container-type:size]"
+        >
           <div
             ref={gridRef}
-            className={`grid gap-[3px] ${shake ? "shake" : ""}`}
+            className={`grid ${shake ? "shake" : ""}`}
             style={{
               gridTemplateColumns: `repeat(${width}, minmax(0, 1fr))`,
               width: `min(100cqw, calc(100cqh * ${width} / ${height}))`,
@@ -837,62 +1194,45 @@ function GameView({
             }}
           >
             {run.grid.map((row, r) =>
-              row.map((cell, c) =>
-                cell ? (
-                  <span key={`${r}-${c}`} className={`dot ${dotClass(cell)}`} />
-                ) : (
-                  <span key={`${r}-${c}`} />
-                ),
-              ),
+              row.map((cell, c) => (
+                <span key={`${r}-${c}`} className="flex items-center justify-center">
+                  {cell ? (
+                    <span className="dot" style={{ width: "var(--dot)", height: "var(--dot)", background: swatch(cell) }} />
+                  ) : null}
+                </span>
+              )),
             )}
           </div>
+        </section>
+        <div ref={gateRef} className="relative my-auto h-28 w-16 shrink-0" aria-hidden>
+          <span className="gate-bar" />
+          <span className="gate-post left-0" />
+          <span className="gate-post right-0" />
+          <span className="gate-mouth" />
         </div>
-        {run.flights.map((flight) => (
-          <span
-            key={flight.id}
-            className={`cargo ${dotClass(flight.color)}`}
-            style={{
-              left: flight.x,
-              top: flight.y,
-              width: flight.size,
-              height: flight.size,
-              ["--dx" as string]: `${flight.dx}px`,
-              ["--dy" as string]: `${flight.dy}px`,
-            }}
-          />
-        ))}
-        <div className="relative h-28 shrink-0">
-          <div className="absolute inset-x-4 top-1/2 h-2 -translate-y-1/2 bg-cream/25" />
-          <div ref={gateRef} className="absolute right-2 bottom-1 h-20 w-9" aria-hidden>
-            <span className="gate-bar" />
-            <span className="gate-post left-0" />
-            <span className="gate-post right-0" />
-            <span className="gate-mouth" />
-          </div>
-        </div>
-      </section>
+      </div>
 
       <div className="relative min-h-[15rem] flex-1">
         <div className="absolute inset-0 overflow-hidden">
-          <div className="absolute inset-x-0 flex" style={{ top: "calc(100% - var(--dock) - 3.5rem)" }}>
+          <div className="absolute inset-x-0 flex" style={{ top: "calc(100% - var(--dock) - 3 * var(--slot) - var(--peek))" }}>
             {Array.from({ length: run.forks }, (_, lane) => (
               <div key={lane} className="flex min-w-0 flex-1 justify-center">
                 {lane < run.rows.length ? (
                   <div
                     key={`${run.bumped[lane] ?? 0}-${run.rows[lane]?.[0]?.id ?? "empty"}`}
-                    className={`flex w-14 flex-col items-center ${run.bumped[lane] ? "queue-up" : ""}`}
+                    className={`flex w-11 flex-col items-center ${run.bumped[lane] ? "queue-up" : ""}`}
                   >
                     {(run.rows[lane] ?? []).map((piece, index) => (
                       <button
                         key={piece.id}
                         type="button"
-                        disabled={index !== 0 || run.won}
+                        disabled={index !== 0 || run.won || run.lost}
                         onClick={() => onSend(lane)}
-                        className={`h-14 w-14 ${index === 0 ? "" : "pointer-events-none"}`}
+                        className={`h-[var(--slot)] w-11 ${index === 0 ? "" : "pointer-events-none"}`}
                         aria-hidden={index === 0 ? undefined : true}
                         aria-label={index === 0 ? `Send ${piece.colors.join(" and ")} worker` : undefined}
                       >
-                        <WorkerFace colors={piece.colors} />
+                        <WorkerFace colors={piece.colors} className="h-full w-full" />
                       </button>
                     ))}
                   </div>
@@ -905,7 +1245,8 @@ function GameView({
         <div className="pointer-events-none absolute inset-0 z-10 flex">
           {Array.from({ length: run.forks }, (_, lane) => {
             const actor = run.actors.find((entry) => entry.lane === lane) ?? null;
-            const facingBack = actor?.phase === "from-gate";
+            const face = actor?.face ?? "right";
+            const moving = actor?.phase === "roll" || actor?.phase === "drive";
             return (
               <div
                 key={lane}
@@ -916,27 +1257,40 @@ function GameView({
                 className="relative h-full min-w-0 flex-1"
               >
                 <div
-                  className="rig absolute top-1 left-1/2 -ml-7 w-14"
+                  className="rig absolute top-1 left-1/2"
                   data-phase={actor?.phase ?? "park"}
-                  style={actor?.phase === "to-gate" ? { transitionDuration: `${actor.haulMs}ms` } : undefined}
+                  style={{
+                    width: "var(--rig-w)",
+                    height: "var(--rig-h)",
+                    marginLeft: "calc(var(--rig-w) / -2)",
+                    transform: `translate(${actor?.tx ?? 0}px, ${actor?.ty ?? 0}px)`,
+                    transitionDuration: moving ? `${actor?.legMs ?? 0}ms` : "0ms",
+                  }}
                 >
-                  <div className={facingBack ? "-scale-x-100" : ""}>
+                  <div className={`relative h-full w-full transition-transform duration-150 ${spinClass(face)}`}>
                     {actor ? (
-                      <div className="rider absolute -top-1 left-0">
-                        <span className={facingBack ? "block -scale-x-100" : "block"}>
-                          <WorkerFace colors={actor.piece.colors} className="size-8" />
+                      <div className="rider absolute top-0 left-0">
+                        <span className={`block ${uprightClass(face)}`}>
+                          <WorkerFace colors={actor.piece.colors} className="size-5" />
                         </span>
                       </div>
                     ) : null}
-                    <img src="/art/forklift.png" alt="" className="h-10 w-14 object-contain" />
+                    {actor?.cargo ? (
+                      <span
+                        className={`cargo-ride ${actor.phase === "drop" ? "cargo-drop" : ""}`}
+                        style={{ background: swatch(actor.cargo) }}
+                      />
+                    ) : null}
+                    <img src="/art/forklift.png" alt="" className="h-full w-full object-contain" />
                   </div>
                 </div>
                 {actor?.phase === "walk" ? (
                   <div
                     key={actor.id}
-                    className="walker-move absolute top-[calc(100%-var(--dock)-3.5rem)] left-1/2 -ml-6"
+                    className="walker-move absolute left-1/2 -ml-5 w-11"
+                    style={{ top: "calc(100% - var(--dock) - 3 * var(--slot) - var(--peek))" }}
                   >
-                    <WorkerFace colors={actor.piece.colors} />
+                    <WorkerFace colors={actor.piece.colors} className="h-11 w-11" />
                   </div>
                 ) : null}
               </div>
@@ -944,14 +1298,14 @@ function GameView({
           })}
         </div>
 
-        {stuck ? (
+        {jammed || run.lost ? (
           <div
             className="absolute inset-x-3 z-30 rounded-2xl bg-coral px-3 py-2 text-center text-sm font-extrabold"
             style={{ bottom: "calc(var(--dock) + 0.4rem)" }}
           >
-            No worker left can reach a loose dot.
+            You lose
             <button type="button" onClick={onRestart} className="mt-1 block w-full rounded-full bg-cream py-2 text-ink">
-              Restart level
+              Restart
             </button>
           </div>
         ) : null}
@@ -961,7 +1315,7 @@ function GameView({
             <button
               key={kind}
               type="button"
-              disabled={save.tokens[kind] <= 0 || run.won}
+              disabled={save.tokens[kind] <= 0 || run.won || run.lost}
               onClick={() => onToken(kind)}
               className="relative rounded-2xl bg-ink-soft px-1 py-1 disabled:opacity-40"
             >
@@ -973,6 +1327,23 @@ function GameView({
           ))}
         </footer>
       </div>
+
+      {run.flights.map((flight) => (
+        <span
+          key={flight.id}
+          className="cargo"
+          style={{
+            left: flight.x,
+            top: flight.y,
+            width: flight.size,
+            height: flight.size,
+            background: swatch(flight.color),
+            animationDuration: `${flight.ms}ms`,
+            ["--dx" as string]: `${flight.dx}px`,
+            ["--dy" as string]: `${flight.dy}px`,
+          }}
+        />
+      ))}
 
       {run.won ? (
         <div className="absolute inset-0 z-40 flex items-center justify-center bg-ink/75 px-6">
@@ -997,21 +1368,76 @@ function GameView({
   );
 }
 
+function forkTip(board: Board, face: Face, tx: number, ty: number) {
+  const left = board.originX + tx;
+  const top = board.originY + ty;
+  const cx = left + board.rigW / 2;
+  const cy = top + board.rigH / 2;
+  if (face === "right") return { x: left + board.rigW - 2, y: cy };
+  if (face === "left") return { x: left + 2, y: cy };
+  if (face === "up") return { x: cx, y: cy - board.rigW / 2 };
+  return { x: cx, y: cy + board.rigW / 2 };
+}
+
+function spinClass(face: Face) {
+  if (face === "left") return "-scale-x-100";
+  if (face === "up") return "-rotate-90";
+  if (face === "down") return "rotate-90";
+  return "";
+}
+
+function uprightClass(face: Face) {
+  if (face === "left") return "-scale-x-100";
+  if (face === "up") return "rotate-90";
+  if (face === "down") return "-rotate-90";
+  return "";
+}
+
 function WorkerFace({ colors, className = "size-12" }: { colors: DotColor[]; className?: string }) {
+  const primary = WORKER_SRC[colors[0]];
+  const secondary = colors[1] ? WORKER_SRC[colors[1]] : undefined;
+  if (primary && (!colors[1] || secondary)) {
+    return (
+      <span className={`relative block ${className}`}>
+        <img src={primary} alt="" className="h-full w-full object-contain object-top" />
+        {secondary ? (
+          <img src={secondary} alt="" className="absolute right-0 bottom-0 h-1/2 w-1/2 bg-cream object-contain" />
+        ) : null}
+      </span>
+    );
+  }
   return (
     <span className={`relative block ${className}`}>
-      <img src={WORKER_SRC[colors[0]]} alt="" className="h-full w-full object-contain" />
+      <img src="/art/worker-yellow.png" alt="" className="h-full w-full object-contain object-top" />
+      <span
+        className="absolute bottom-[18%] left-1/2 h-[30%] w-[46%] -translate-x-1/2 border-2 border-ink"
+        style={{ background: swatch(colors[0]) }}
+      />
       {colors[1] ? (
-        <img src={WORKER_SRC[colors[1]]} alt="" className="absolute right-0 bottom-0 h-1/2 w-1/2 bg-cream object-contain" />
+        <span
+          className="absolute right-[6%] bottom-[18%] h-[22%] w-[28%] border-2 border-ink"
+          style={{ background: swatch(colors[1]) }}
+        />
       ) : null}
     </span>
   );
 }
 
-function crewCanWork(run: Run): boolean {
-  return run.rows.some((row) => row.some((piece) => hammer(run.grid, piece.colors).removed.length > 0));
-}function dotClass(color: DotColor): string {
-  return `dot-${color}`;
+function forkliftsJammed(run: Run, boardFor: (lane: number, cols: number, rows: number) => Board | null) {
+  if (run.won || run.pending.length > 0 || remainingCount(run.grid) === 0) return false;
+  if (run.actors.some((actor) => actor.phase !== "wait")) return false;
+  const queued = run.rows.some((row) => row.length > 0);
+  if (run.actors.length < run.forks && queued) return false;
+  if (run.actors.length === 0) return true;
+  const cols = run.grid[0]?.length ?? 1;
+  const rows = run.grid.length;
+  for (const actor of run.actors) {
+    const board = boardFor(actor.lane, cols, rows);
+    if (!board) return false;
+    const from = actor.node ?? bottomNode(board, board.originX + board.rigW / 2);
+    if (reachableSpots(run.grid, board, actor.piece.colors, from).length > 0) return false;
+  }
+  return true;
 }
 
 function Sheet({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {

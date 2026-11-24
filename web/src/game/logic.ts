@@ -1,6 +1,6 @@
 export const COLORS = ["red", "blue", "yellow", "green", "purple", "orange"] as const;
 
-export type DotColor = (typeof COLORS)[number];
+export type DotColor = string;
 
 export type Cell = DotColor | null;
 
@@ -29,6 +29,11 @@ export function isEdge(grid: Grid, row: number, col: number): boolean {
   return false;
 }
 
+export function colorRemains(grid: Grid, colors: readonly DotColor[]): boolean {
+  const wanted = new Set(colors);
+  for (const row of grid) for (const cell of row) if (cell && wanted.has(cell)) return true;
+  return false;
+}
 export function remainingCount(grid: Grid): number {
   let count = 0;
   for (const row of grid) for (const cell of row) if (cell) count += 1;
@@ -38,7 +43,8 @@ export function remainingCount(grid: Grid): number {
 export function colorsOnBoard(grid: Grid): DotColor[] {
   const found = new Set<DotColor>();
   for (const row of grid) for (const cell of row) if (cell) found.add(cell);
-  return COLORS.filter((color) => found.has(color));
+  const extras = [...found].filter((color) => !COLORS.includes(color as (typeof COLORS)[number]));
+  return [...COLORS.filter((color) => found.has(color)), ...extras];
 }
 
 export function hammer(
@@ -78,11 +84,11 @@ export function wipeColor(grid: Grid, color: DotColor): { grid: Grid; removed: n
 export function solve(grid: Grid): DotColor[] {
   const working = cloneGrid(grid);
   const sequence: DotColor[] = [];
-  for (let guard = 0; guard < 500; guard += 1) {
+  for (let guard = 0; guard < 8000; guard += 1) {
     if (remainingCount(working) === 0) return sequence;
     let best: DotColor | null = null;
     let bestCount = 0;
-    for (const color of COLORS) {
+    for (const color of colorsOnBoard(working)) {
       let count = 0;
       for (let row = 0; row < working.length; row += 1) {
         for (let col = 0; col < working[row].length; col += 1) {

@@ -1,5 +1,8 @@
 # Pixelize Design Document
 
+## Next
+Masterpiece is not a separate level. Drawing a level should work the same way: load a picture, flatten it to a 32-color palette, pixelize it, and play that grid. Do not keep a second "Masterpiece" mode beside the campaign.
+
 ## Visual Style
 - Cartoonish, bright, playful. Soft outlines, vibrant colors.
 - Workers: Cute characters with hard hats, overalls, different colors matching pixel colors. Simple animations (walk, jump, hammer).

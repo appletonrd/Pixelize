@@ -92,7 +92,7 @@
 
 @keyframes queue-up {
   from {
-    transform: translateY(3.5rem);
+    transform: translateY(2.75rem);
   }
   to {
     transform: translateY(0);
@@ -113,49 +113,30 @@
 }
 
 .rig {
-  --lift: 180px;
-  --wait-lift: 128px;
-  --haul-x: 48px;
-  --walk: 140px;
   transform: translate(0, 0);
-  transition: transform 700ms linear;
+  transition: transform linear;
 }
 
-.rig[data-phase="walk"],
-.rig[data-phase="park"] {
-  transform: translate(0, 0);
+.cargo-ride {
+  position: absolute;
+  top: 58%;
+  right: 4%;
+  z-index: 2;
+  width: var(--dot, 12px);
+  height: var(--dot, 12px);
+  transform: translate(0, -50%);
+  box-shadow: inset 0 -2px 0 rgb(0 0 0 / 0.18);
 }
 
-.rig[data-phase="drive"],
-.rig[data-phase="wait"] {
-  transform: translate(0, calc(-1 * var(--wait-lift)));
-  transition-duration: 700ms;
+.cargo-drop {
+  animation: into-gate 240ms linear forwards;
 }
 
-.rig[data-phase="enter"] {
-  transform: translate(0, calc(-1 * var(--lift)));
-  transition-duration: 280ms;
-}
-
-.rig[data-phase="to-gate"],
-.rig[data-phase="unload"] {
-  transform: translate(var(--haul-x), calc(-1 * var(--lift)));
-}
-
-.rig[data-phase="from-gate"] {
-  transform: translate(0, calc(-1 * var(--lift)));
-  transition-duration: 720ms;
-}
-
-.rig[data-phase="exit"] {
-  transform: translate(0, calc(-1 * var(--wait-lift)));
-  transition-duration: 280ms;
-}
-
-.rig[data-phase="down"],
-.rig[data-phase="leave"] {
-  transform: translate(0, 0);
-  transition-duration: 660ms;
+@keyframes into-gate {
+  to {
+    transform: translate(12px, -50%) scale(0.45);
+    opacity: 0;
+  }
 }
 
 .rider {
@@ -167,12 +148,9 @@
 
 .rig[data-phase="drive"] .rider,
 .rig[data-phase="wait"] .rider,
-.rig[data-phase="enter"] .rider,
-.rig[data-phase="to-gate"] .rider,
-.rig[data-phase="unload"] .rider,
-.rig[data-phase="from-gate"] .rider,
-.rig[data-phase="exit"] .rider,
-.rig[data-phase="down"] .rider {
+.rig[data-phase="roll"] .rider,
+.rig[data-phase="load"] .rider,
+.rig[data-phase="drop"] .rider {
   opacity: 1;
 }
 

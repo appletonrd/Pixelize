@@ -58,11 +58,11 @@ export function writeSave(save: Save) {
   localStorage.setItem(KEY, JSON.stringify(save));
 }
 
-export function grantProgress(save: Save, levelJustCleared: number): { save: Save; token: TokenKind | null } {
+export function grantClear(save: Save, coins: number, nextLevel: number | null): { save: Save; token: TokenKind | null } {
   const next: Save = {
     ...save,
-    level: levelJustCleared + 1,
-    coins: save.coins + coinsFor(levelJustCleared),
+    level: nextLevel ?? save.level,
+    coins: save.coins + coins,
     progress: save.progress + POINTS_PER_LEVEL,
     tokens: { ...save.tokens },
   };
@@ -73,4 +73,8 @@ export function grantProgress(save: Save, levelJustCleared: number): { save: Sav
     next.tokens[token] += 1;
   }
   return { save: next, token };
+}
+
+export function grantProgress(save: Save, levelJustCleared: number): { save: Save; token: TokenKind | null } {
+  return grantClear(save, coinsFor(levelJustCleared), levelJustCleared + 1);
 }
